@@ -1086,7 +1086,6 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
         }
         let wasMenuOpen = menuWasOpen ?? isMenuOpen
         isRefreshing = true
-        statusItem.button?.title = "..."
         rebuildMenu(updateVisiblePanel: wasMenuOpen)
         defer {
             isRefreshing = false

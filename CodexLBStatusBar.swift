@@ -7,9 +7,15 @@ private let defaultBaseURL = "http://127.0.0.1:2455"
 private let appDisplayName = "Codex LB Status"
 private let serverVersionMenuItemIdentifier = NSUserInterfaceItemIdentifier("codexLBServerVersion")
 
+private enum SavedLoginRole: String {
+    case admin
+    case guest
+}
+
 private final class SettingsStore {
     private let defaults = UserDefaults.standard
     private let baseURLKey = "codexLBBaseURL"
+    private let loginRolesKey = "codexLBLoginRolesByURL"
 
     var baseURLString: String {
         get {
@@ -24,6 +30,17 @@ private final class SettingsStore {
         URL(string: baseURLString) ?? URL(string: defaultBaseURL)!
     }
 
+    func loginRole(for baseURL: String) -> SavedLoginRole {
+        let roles = defaults.dictionary(forKey: loginRolesKey)
+        return SavedLoginRole(rawValue: roles?[baseURL] as? String ?? "") ?? .admin
+    }
+
+    func setLoginRole(_ role: SavedLoginRole, for baseURL: String) {
+        var roles = defaults.dictionary(forKey: loginRolesKey) ?? [:]
+        roles[baseURL] = role.rawValue
+        defaults.set(roles, forKey: loginRolesKey)
+    }
+
     private static func normalizedBaseURL(_ value: String) -> String {
         let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else {
@@ -33,37 +50,41 @@ private final class SettingsStore {
     }
 }
 
-private enum AdminPasswordStore {
-    private static let service = "local.codex-lb.statusbar.admin-password"
-
-    static func read(for baseURL: String) -> String? {
-        let query: [String: Any] = [
+private enum DashboardPasswordStore {
+    private static func query(for role: SavedLoginRole, baseURL: String) -> [String: Any] {
+        [
             kSecClass as String: kSecClassGenericPassword,
-            kSecAttrService as String: service,
-            kSecAttrAccount as String: baseURL,
+            kSecAttrService as String: "local.codex-lb.statusbar.\(role.rawValue)-password",
+            kSecAttrAccount as String: baseURL
+        ]
+    }
+
+    static func read(_ role: SavedLoginRole, for baseURL: String) -> String? {
+        let lookup = query(for: role, baseURL: baseURL).merging([
             kSecReturnData as String: true,
             kSecMatchLimit as String: kSecMatchLimitOne
-        ]
+        ]) { _, new in new }
         var result: CFTypeRef?
-        guard SecItemCopyMatching(query as CFDictionary, &result) == errSecSuccess,
+        guard SecItemCopyMatching(lookup as CFDictionary, &result) == errSecSuccess,
               let data = result as? Data else {
             return nil
         }
         return String(data: data, encoding: .utf8)
     }
 
-    static func save(_ password: String, for baseURL: String) -> OSStatus {
-        let query: [String: Any] = [
-            kSecClass as String: kSecClassGenericPassword,
-            kSecAttrService as String: service,
-            kSecAttrAccount as String: baseURL
-        ]
+    static func save(_ password: String, role: SavedLoginRole, for baseURL: String) -> OSStatus {
+        let query = query(for: role, baseURL: baseURL)
         let attributes: [String: Any] = [kSecValueData as String: Data(password.utf8)]
         let status = SecItemUpdate(query as CFDictionary, attributes as CFDictionary)
         if status == errSecItemNotFound {
             return SecItemAdd(query.merging(attributes) { _, new in new } as CFDictionary, nil)
         }
         return status
+    }
+
+    static func delete(_ role: SavedLoginRole, for baseURL: String) -> OSStatus {
+        let status = SecItemDelete(query(for: role, baseURL: baseURL) as CFDictionary)
+        return status == errSecItemNotFound ? errSecSuccess : status
     }
 }
 
@@ -1135,28 +1156,39 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
             } catch ClientError.unauthorized {
                 authSession = nil
             }
-            if authSession?.role == "admin" {
+            if authSession?.authenticated == true {
                 autoLoginAttemptedForURL = nil
             }
             if authSession?.authenticated != true,
-               autoLoginAttemptedForURL != settings.baseURLString,
-               let password = AdminPasswordStore.read(for: settings.baseURLString) {
-                autoLoginAttemptedForURL = settings.baseURLString
-                let session = try await client.loginPassword(password)
-                if session.totpRequiredOnLogin {
-                    guard let code = promptText(
-                        title: "TOTP required",
-                        message: "Enter the dashboard TOTP code.",
-                        defaultValue: "",
-                        secure: false
-                    ) else {
-                        return
+               autoLoginAttemptedForURL != settings.baseURLString {
+                let baseURL = settings.baseURLString
+                switch settings.loginRole(for: baseURL) {
+                case .admin:
+                    if let password = DashboardPasswordStore.read(.admin, for: baseURL) {
+                        autoLoginAttemptedForURL = baseURL
+                        let session = try await client.loginPassword(password)
+                        if session.totpRequiredOnLogin {
+                            guard let code = promptText(
+                                title: "TOTP required",
+                                message: "Enter the dashboard TOTP code.",
+                                defaultValue: "",
+                                secure: false
+                            ) else {
+                                return
+                            }
+                            authSession = try await client.verifyTotp(code)
+                        } else {
+                            authSession = session
+                        }
                     }
-                    authSession = try await client.verifyTotp(code)
-                } else {
-                    authSession = session
+                case .guest:
+                    let password = DashboardPasswordStore.read(.guest, for: baseURL)
+                    if password != nil || authSession?.guestPasswordRequired != true {
+                        autoLoginAttemptedForURL = baseURL
+                        authSession = try await client.loginGuest(password: password)
+                    }
                 }
-                if authSession?.role == "admin" {
+                if authSession?.authenticated == true {
                     autoLoginAttemptedForURL = nil
                 }
             }
@@ -1382,6 +1414,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
         }
         Task {
             do {
+                let baseURL = settings.baseURLString
                 let session = try await client.loginPassword(password)
                 if session.totpRequiredOnLogin {
                     guard let code = promptText(
@@ -1394,7 +1427,8 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
                     }
                     _ = try await client.verifyTotp(code)
                 }
-                let status = AdminPasswordStore.save(password, for: settings.baseURLString)
+                let status = DashboardPasswordStore.save(password, role: .admin, for: baseURL)
+                settings.setLoginRole(.admin, for: baseURL)
                 await refresh()
                 if status != errSecSuccess {
                     showError("Admin login succeeded, but the password could not be saved in Keychain (error \(status)).")
@@ -1416,8 +1450,16 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
         }
         Task {
             do {
+                let baseURL = settings.baseURLString
                 _ = try await client.loginGuest(password: password.isEmpty ? nil : password)
+                let status = password.isEmpty
+                    ? DashboardPasswordStore.delete(.guest, for: baseURL)
+                    : DashboardPasswordStore.save(password, role: .guest, for: baseURL)
+                settings.setLoginRole(.guest, for: baseURL)
                 await refresh()
+                if status != errSecSuccess {
+                    showError("Guest login succeeded, but its Keychain entry could not be updated (error \(status)).")
+                }
             } catch {
                 showError(error.localizedDescription)
             }

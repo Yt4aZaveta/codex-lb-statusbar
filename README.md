@@ -50,7 +50,7 @@ swiftc StatusBarLogic.swift StatusBarLogicTests.swift -o /tmp/statusbar-logic-te
 ## Runtime Notes
 
 - The server URL is stored in `UserDefaults` for the current macOS user.
-- After a successful admin login, the password is stored in macOS Keychain for that server URL and reused when the session expires. TOTP still requires a code when enabled.
+- After a successful admin or password-protected guest login, the password is stored in macOS Keychain for that server URL. The last selected login role is restored when the session expires; passwordless guest access is remembered without storing a password. TOTP still requires a code when enabled.
 - `Launch at Login` uses the native macOS login-item service.
 - Error and empty states are shown in English.
 

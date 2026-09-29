@@ -1,5 +1,6 @@
 import Cocoa
 import Foundation
+import Security
 import ServiceManagement
 
 private let defaultBaseURL = "http://127.0.0.1:2455"
@@ -29,6 +30,40 @@ private final class SettingsStore {
             return defaultBaseURL
         }
         return trimmed.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+    }
+}
+
+private enum AdminPasswordStore {
+    private static let service = "local.codex-lb.statusbar.admin-password"
+
+    static func read(for baseURL: String) -> String? {
+        let query: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: service,
+            kSecAttrAccount as String: baseURL,
+            kSecReturnData as String: true,
+            kSecMatchLimit as String: kSecMatchLimitOne
+        ]
+        var result: CFTypeRef?
+        guard SecItemCopyMatching(query as CFDictionary, &result) == errSecSuccess,
+              let data = result as? Data else {
+            return nil
+        }
+        return String(data: data, encoding: .utf8)
+    }
+
+    static func save(_ password: String, for baseURL: String) -> OSStatus {
+        let query: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: service,
+            kSecAttrAccount as String: baseURL
+        ]
+        let attributes: [String: Any] = [kSecValueData as String: Data(password.utf8)]
+        let status = SecItemUpdate(query as CFDictionary, attributes as CFDictionary)
+        if status == errSecItemNotFound {
+            return SecItemAdd(query.merging(attributes) { _, new in new } as CFDictionary, nil)
+        }
+        return status
     }
 }
 
@@ -1053,6 +1088,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
     private var lastRefreshedAt: Date?
     private var refreshTimer: Timer?
     private var accountMutations: [String: AccountMutation] = [:]
+    private var autoLoginAttemptedForURL: String?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.accessory)
@@ -1094,7 +1130,36 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
         }
 
         do {
-            authSession = try await client.getSession()
+            do {
+                authSession = try await client.getSession()
+            } catch ClientError.unauthorized {
+                authSession = nil
+            }
+            if authSession?.role == "admin" {
+                autoLoginAttemptedForURL = nil
+            }
+            if authSession?.authenticated != true,
+               autoLoginAttemptedForURL != settings.baseURLString,
+               let password = AdminPasswordStore.read(for: settings.baseURLString) {
+                autoLoginAttemptedForURL = settings.baseURLString
+                let session = try await client.loginPassword(password)
+                if session.totpRequiredOnLogin {
+                    guard let code = promptText(
+                        title: "TOTP required",
+                        message: "Enter the dashboard TOTP code.",
+                        defaultValue: "",
+                        secure: false
+                    ) else {
+                        return
+                    }
+                    authSession = try await client.verifyTotp(code)
+                } else {
+                    authSession = session
+                }
+                if authSession?.role == "admin" {
+                    autoLoginAttemptedForURL = nil
+                }
+            }
             overview = try await client.fetchOverview()
             lastRefreshedAt = Date()
             latestError = nil
@@ -1300,6 +1365,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
         }
         settings.baseURLString = value
         client = CodexLBClient(settings: settings)
+        autoLoginAttemptedForURL = nil
         Task {
             await refresh()
         }
@@ -1328,7 +1394,11 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
                     }
                     _ = try await client.verifyTotp(code)
                 }
+                let status = AdminPasswordStore.save(password, for: settings.baseURLString)
                 await refresh()
+                if status != errSecSuccess {
+                    showError("Admin login succeeded, but the password could not be saved in Keychain (error \(status)).")
+                }
             } catch {
                 showError(error.localizedDescription)
             }

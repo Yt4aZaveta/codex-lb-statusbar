@@ -34,6 +34,7 @@ xcrun swiftc \
   "${STATUSBAR_DIR}/CodexLBStatusBar.swift" \
   -framework Cocoa \
   -framework Foundation \
+  -framework Security \
   -framework ServiceManagement
 
 cat > "${CONTENTS_DIR}/Info.plist" <<PLIST
